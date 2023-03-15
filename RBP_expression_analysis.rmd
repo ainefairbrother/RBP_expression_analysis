@@ -1,0 +1,412 @@
+---
+title: "Gene expression across samples from GTEx v8 tissues"
+author: 
+- name: "Aine Fairbrother-Browne"
+  affiliation: UCL
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: 
+  bookdown::html_document2:
+    figure_caption: yes
+    code_folding: show
+    theme: paper
+    highlight: kate
+    df_print: paged
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include = FALSE}
+
+library(here) # For project-specific paths
+library(ggplot2) # For plotting
+library(tidyverse) # For tidy manipulation of data
+library(stringr) # For string manipulation
+
+knitr::opts_chunk$set(echo = T, warning = F, message = F, dpi=600)
+
+# Set defaults for ggplots 
+theme_rhr <- theme_set(
+  theme_bw(base_family = "Helvetica",
+           base_size = 10) + 
+  theme(panel.grid.major.x = element_blank(),
+        legend.position = "top",
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        axis.title.y = element_text(vjust = 0.6),
+        panel.spacing = unit(0.1, "lines"))
+)
+
+```
+
+# Background
+
+1.  Produced as a consequence of the variability in the expression levels of the RNA Binding Proteins (RBPs) responsible for recognising the starting and ending position of each intron.
+2.  Not detectable in higher quantities using RNA-seq data, as the NMD machinery might have already acted to remove the most deleterious versions of the noise.
+
+For test whether these two hypotheses are true, we would like to obtain two heatmaps representing:
+
+1.  The levels of expression of a set of splicesomal RBPs across the tissues. Ideally, this heatmap will display changing colours across the different tissues, evidencing expression differences of each RBP in each body site.
+2.  The levels of expression of a set of genes forming the NMD machinery. Ideally, this heatmap will also display different colours across the different tissues, which will evidence that the NMD machinery works at different rates across the tissues.
+
+# Methods {.tabset}
+
+To measure the level of expression of the spliceosomal RBPs and the NMD machinery across the samples of each GTEx v8 tissue, I have followed the method below:
+
+1.  Obtain the spliceosomal RBPs made available by Van Nostrand et al.: *In 2020 Van Nostrand et al. published a study reporting the results of studying the functions of 356 human RBPs using integrative approaches consisting of 5 assays (eCLIP, RNA Bind-N-Seq, Immunofluorescence, Knockdown RNA-seq, RBP ChIP-Seq) that focused on different aspects of RBP activity.* [A Large-Scale Binding and Functional Map of Human RNA Binding Proteins](https://www.nature.com/articles/s41586-020-2077-3).
+2.  Obtain the genes forming the NMD machinery from the REACTOME ontology ([R-HSA-927802]NMDv3.7Browserv82).
+3.  Calculate the TPM levels of each gene from the two lists above by using the function **'recount::getTPM(rse)'**. Before using this function, the raw counts were previously transformed using the function **'recount3::transform_counts(rse)'**. The TPM values provided have not been covariate corrected.
+4.  Obtain the covariates of interest per sample. Some of them were categorical, so they where transformed into numerical values, and corresponded to: age, center, gebtch, gebtchd, nabtc, nabtchd, nabtcht, hhrdy, sex, rin. These covariates were chosen by following [Fairbrother-Browne, A. et.al](https://www.nature.com/articles/s42003-021-02792-w) method's approach.
+
+# Code used {.tabset}
+
+## Reproducible Code
+
+```{r example-supp-code, eval = F}
+
+library(tidyverse)
+library(GenomicRanges)
+library(DESeq2)
+library(SummarizedExperiment)
+library(biomaRt)
+
+## source("/home/sruiz/PROJECTS/splicing-project-recount3/pipeline4-3_RBP_expression.R")
+
+
+## Load reference GTF and get only the genes
+ensembl105 <- biomaRt::useEnsembl(biomart = 'genes', 
+                                  dataset = 'hsapiens_gene_ensembl',
+                                  version = 105)
+
+################################
+## FUNCTIONS       
+################################
+
+get_genes_to_analyse_expression <- function(type) {
+  
+  if (type == "RBP") {
+    
+    ## Load the RBPs and add the ensemblID
+    all_RBPs <- xlsx::read.xlsx(file = './RBPs.xlsx', 
+                                sep = '\t', header = TRUE,
+                                sheetIndex = 1) %>%  as_tibble() 
+    
+    ## Tidy them
+    genes_annotated <- biomaRt::getBM(
+      attributes = c('ensembl_gene_id', 'hgnc_symbol'), 
+      filters = 'hgnc_symbol',
+      values = all_RBPs$name %>% na.omit() %>% unique(),
+      mart = ensembl105
+    )
+    genes_annotated <- genes_annotated %>%
+      distinct(hgnc_symbol, .keep_all = T)
+    
+    
+  } else {
+    
+    ## Load the NMD molecules
+    all_NMD <- read.delim(file = './NMD.txt',
+                          sep = '\t', header = TRUE) %>% as_tibble() %>% 
+      dplyr::select(hgnc_symbol = Name) %>%
+      distinct(hgnc_symbol)
+    
+    ## Tidy them
+    genes_annotated <- biomaRt::getBM(
+      attributes = c('ensembl_gene_id', 'hgnc_symbol'), 
+      filters = 'hgnc_symbol',
+      values = all_NMD$hgnc_symbol %>% na.omit() %>% unique(),
+      mart = ensembl105
+    )
+    genes_annotated <- genes_annotated %>%
+      distinct(hgnc_symbol, .keep_all = T)
+  }
+  
+  return(genes_annotated)
+}
+
+get_GTEx_gene_expression <- function(rse, ensembl, recount3 = T) {
+  
+  
+  ################################################
+  ## Compute TPM values using recount3 approach
+  ################################################
+  
+  SummarizedExperiment::assays(rse)$TPM <- recount::getTPM(rse)
+  ## Should all be equal to 1
+  indx <- which(colSums(SummarizedExperiment::assay(rse, "TPM")) / 1e6 > 1) 
+  
+  any(SummarizedExperiment::assays(rse)$TPM[-(indx %>% unlist %>% unname),]/ 1e6 > 1)
+  
+  ## Tidy the dataframe
+  recount_dds_tpm <- SummarizedExperiment::assays(rse)$TPM[-(indx %>% unlist %>% unname),] %>%
+    as_tibble(rownames = "gene") %>% 
+    mutate(gene = gene %>% str_remove("\\..*")) %>% 
+    tidyr::gather(key = sample, value = tpm, -gene)
+
+  
+  ## 1. Filter by only "USE ME" samples
+  
+  sample_used <- rse %>% 
+    SummarizedExperiment::colData() %>%
+    as_tibble() %>%
+    filter(gtex.smafrze != "EXCLUDE") %>%
+    pull(external_id)
+
+  
+  recount_dds_tpm <- recount_dds_tpm %>% 
+    filter(sample %in% sample_used) 
+
+  ## 2. Add gene name
+  
+  mapping <- biomaRt::getBM(
+    attributes = c('ensembl_gene_id', 'hgnc_symbol'), 
+    filters = 'ensembl_gene_id',
+    values = recount_dds_tpm$gene %>% unique,
+    mart = ensembl
+  )
+  
+  df_return <- recount_dds_tpm %>% 
+    mutate(project = project_id) %>%
+    dplyr::left_join(mapping,
+                     by =  c("gene" = "ensembl_gene_id"))
+  
+  ## 3. Return recount3 TPM counts
+  
+  return(df_return)
+  
+}
+
+tidy_sample_metadata <- function(rse, samples) {
+  
+  sample_metadata <- rse %>% 
+    SummarizedExperiment::colData() %>%
+    as_tibble() %>%
+    filter(gtex.smafrze != "EXCLUDE",
+           external_id %in% samples)
+  
+  age_numeric <- as.numeric(factor(as.matrix(sample_metadata$gtex.age))) 
+  sample_metadata$gtex.age <- age_numeric
+ 
+  sample_metadata <- sample_metadata %>%
+    tibble::column_to_rownames(var = "external_id")
+  
+  covariates <- c("gtex.age", "gtex.smcenter", "gtex.smtsd",
+                  "gtex.smgebtch", "gtex.smgebtchd",
+                  "gtex.smnabtch", "gtex.smnabtchd", "gtex.smnabtcht",
+                  "gtex.dthhrdy", "gtex.sex", "gtex.smrin")
+  
+  
+  smcenter <- as.numeric(factor(as.matrix(sample_metadata$gtex.smcenter))) 
+  sample_metadata$gtex.smcenter <- smcenter
+  
+  gtex.smgebtch <- as.numeric(factor(as.matrix(sample_metadata$gtex.smgebtch))) 
+  sample_metadata$gtex.smgebtch <- gtex.smgebtch
+  
+  gtex.smgebtchd <- as.numeric(factor(as.matrix(sample_metadata$gtex.smgebtchd))) 
+  sample_metadata$gtex.smgebtchd <- gtex.smgebtchd
+  
+  gtex.smnabtch <- as.numeric(factor(as.matrix(sample_metadata$gtex.smnabtch))) 
+  sample_metadata$gtex.smnabtch <- gtex.smnabtch
+  
+  gtex.smnabtchd <- as.numeric(factor(as.matrix(sample_metadata$gtex.smnabtchd))) 
+  sample_metadata$gtex.smnabtchd <- gtex.smnabtchd
+  
+  gtex.smnabtcht <- as.numeric(factor(as.matrix(sample_metadata$gtex.smnabtcht))) 
+  sample_metadata$gtex.smnabtcht <- gtex.smnabtcht
+  
+  gtex.smtsd <- as.numeric(factor(as.matrix(sample_metadata$gtex.smtsd))) 
+  sample_metadata$gtex.smtsd <- gtex.smtsd
+  
+  
+  # 8. Return covariates ---------------------------
+  
+  return(t(sample_metadata %>%
+           dplyr::select(all_of(covariates))))
+}
+
+
+################################################################################
+# 0. Prepare the necessary data ------------------------------------------------
+################################################################################
+
+
+projects_used <- readRDS(file = "./all_projects_used.rds")
+
+for (project_id in projects_used) {
+  
+  # project_id <- projects_used[20]
+  
+  ## Load the recount3 data
+  rse <- recount3::create_rse_manual(
+    project = project_id,
+    project_home = "data_sources/gtex",
+    organism = "human",
+    annotation = "gencode_v29",
+    type = "gene")
+  
+  
+  ## Transform counts
+  SummarizedExperiment::assays(rse)$counts <- recount3::transform_counts(rse)
+  
+  ## See that now we have two assayNames()
+  SummarizedExperiment::assayNames(rse)
+  
+  ## Get metadata
+  metadata <- rse %>% 
+    SummarizedExperiment::colData() %>%
+    as_tibble() %>%
+    filter(gtex.smrin >= 6.0,
+           gtex.smafrze != "EXCLUDE") 
+  
+  ## Get cluster names from the current project
+  clusterIDs <- metadata$gtex.smtsd %>% unique()
+  
+  for (cluster in clusterIDs) {
+    
+    
+    # cluster <-  clusterIDs[1]
+    
+    cluster_metadata <- metadata %>%
+      filter(gtex.smtsd == cluster)
+    
+    ################################################################################
+    # 1. Get the TPM expression using GTEX data --------------------------------
+    ################################################################################
+    
+    dds_tpm <- get_GTEx_gene_expression(rse = rse, ensembl = ensembl105)
+    dds_tpm <- dds_tpm %>% filter(tpm > 0)
+    
+    for (type in c("RBP", "NMD")) {
+      
+      print(paste0(Sys.time(), " - ", cluster, "...", type))
+      
+      genes <- get_genes_to_analyse_expression(type)
+      
+      # Tidy the 'dds_tpm' object
+      dds_tpm_pv <- dds_tpm %>%
+        dplyr::filter(gene %in% genes$ensembl_gene_id) %>%
+        dplyr::select(gene, sample, tpm) %>%
+        filter(sample %in% cluster_metadata$external_id) %>%
+        group_by(gene) %>%
+        distinct(sample, .keep_all = T) %>%
+        pivot_wider(names_from = sample, values_from = tpm, values_fill = 0)
+      
+      ## Save data
+      folder_name <- paste0("./", type, "/", cluster, "/")
+      dir.create(file.path(folder_name), recursive = TRUE, showWarnings = T)
+      
+      write.csv(x = dds_tpm_pv %>% tibble::column_to_rownames("gene"),
+                file = paste0(folder_name, "/tpm_ensembl105.csv"))
+      
+      ################################################################################
+      # 2. Get the covariates to correct for -----------------------------------------
+      ################################################################################
+      
+      sample_metadata <- tidy_sample_metadata(rse, samples = cluster_metadata$external_id)
+      
+      
+      write_csv(x = sample_metadata %>% as_tibble(rownames = "covariates"), 
+                file = paste0(folder_name, "/covariates.csv"))
+      
+      if (!identical(names(sample_metadata %>% as_tibble(rownames = "covariates"))[-1] %>% sort(), 
+                     names(dds_tpm_pv %>% tibble::column_to_rownames("gene")) %>% sort())) {
+        print("ERROR! Covariates and gene expression have different sample IDs associated.")
+        break;
+      }
+      
+    }
+  
+  }
+  
+  rm(rse)
+  rm(dds_tpm)
+  rm(dds_tpm_pv)
+  rm(sample_metadata)
+  gc()
+  
+}
+
+```
+
+# Results {.tabset}
+
+Below are plots that visualise the cross-tissue variation in (uncorrected) TPM for NMD genes and RBP genes across 42 GTEx tissues.
+
+## NMDs (med. TPM, var, sd, med. TPM log2fc)
+
+```{r NMDs, fig.width=15, fig.height=10, fig.cap="\\label{fig:NMDs} Figure to show how NMD genes vary across GTEx tissues. A. Heatmap to show median TPM. B. Boxplots to show distributions of cross-tissue standard deviations. C. Boxplots to show distributions of cross-tissue variances. D. Heatmap to show, for each gene, and each tissue, log10(fold-change) expression with respect to the median tissue (for the gene)."}
+
+source("./R/01-wrangle_and_plot.R")
+
+# NMDs
+read_delim("./NMD.txt", delim="\t", col_names=T)$Name %>% 
+  ensembldb::select(EnsDb.Hsapiens.v79, keys=., keytype = "SYMBOL", columns = c("SYMBOL","GENEID")) %>% 
+  wrangle.data.gen.heatmap(
+    gene.list=.,
+    data.path="./data/NMD",
+    fig.file="NMD_plot",
+    txt.size=7.5
+  )
+
+```
+
+## RBPs (med. TPM, var, sd, med. TPM log2fc)
+
+```{r RBPs, fig.width=15, fig.height=10, fig.cap="\\label{fig:RBPs} Figure to show how RBP genes vary across GTEx tissues. A. Heatmap to show median TPM. B. Boxplots to show distributions of cross-tissue standard deviations. C. Boxplots to show distributions of cross-tissue variances. D. Heatmap to show, for each gene, and each tissue, log2(fold-change) expression with respect to the median tissue (for the gene)."}
+
+source("./R/01-wrangle_and_plot.R")
+
+# RBPs
+read_delim("./RBPs_yellow_highlight.txt", delim="\t", col_names=F)$X1 %>% 
+  ensembldb::select(EnsDb.Hsapiens.v79, keys=., keytype = "GENEID", columns = c("SYMBOL","GENEID")) %>% 
+wrangle.data.gen.heatmap(
+  gene.list=.,
+  data.path="./data/RBP",
+  fig.file="RBP_plot", 
+  txt.size=7.5
+)
+
+```
+
+## NMDs with gene subgroups (med. TPM)
+
+```{r RBPs_subgroups_tpm, fig.width=10, fig.height=6, fig.cap="\\label{fig:RBPs_subgroups_tpm} Heatmap to show median TPM."}
+
+source("./R/02-add_RBP_gene_subgroups.R")
+
+wrangle.data.gen.heatmap.avgTPM(
+  data.path="./data/RBP/",
+  rbp.subgroup.xlsx="./RBPs_subgroups.xlsx",
+  txt.size=5.5
+)
+  
+```
+
+## NMDs with gene subgroups (med. TPM log2fc)
+
+```{r RBPs_subgroups_lfc, fig.width=10, fig.height=6, fig.cap="\\label{fig:RBPs_subgroups_lfc} Heatmap to show, for each gene, and each tissue, log2(fold-change) expression with respect to the median tissue (for the gene)."}
+
+source("./R/02-add_RBP_gene_subgroups.R")
+
+wrangle.data.gen.heatmap.lfc(
+  data.path="./data/RBP/",
+  rbp.subgroup.xlsx="./RBPs_subgroups.xlsx",
+  txt.size=5.5
+)
+  
+```
+
+
+# Session info
+
+<details>
+
+<summary>Show/hide</summary>
+
+```{r reproducibility, echo = FALSE}
+# Session info
+library("sessioninfo")
+options(width = 120)
+session_info()
+```
+
+</details>
